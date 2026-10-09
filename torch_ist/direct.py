@@ -272,47 +272,93 @@ def _match(left: Tensor, right: Tensor) -> Tensor:
     return (right * left).sum(-1) / (right * right).sum(-1)
 
 
-def _schrodinger_bound_b_raw(u1: Tensor, k: Tensor, grid: Grid) -> Tensor:
+def _split_index(grid: Grid, x_match: float) -> int:
+    """Number of cells left of the matching point (kept away from the ends)."""
+    m = int(round((x_match - grid.x_left) / grid.h))
+    return min(max(m, 1), grid.n - 1)
+
+
+def _schrodinger_bound_b_raw(u1: Tensor, k: Tensor, grid: Grid, x_match: Tensor) -> Tensor:
     """b(k) at bound states k = i kappa, computed stably by matching the left
     Jost solution (integrated rightwards) with the right Jost solution
-    (integrated leftwards) at the bottom of the well.  u1: (n,), k: (K,)."""
+    (integrated leftwards) at x_match, which should sit near the peak of the
+    eigenfunction: each solution is then only ever integrated in its growing
+    direction.  (Matching elsewhere fails for separated multi-solitons, where
+    an eigenfunction is exponentially small in the other wells.)
+    u1: (n,), k: (K,), x_match: (K,)."""
     cdt = complex_dtype(u1.dtype)
     k = k.to(cdt)
-    m = int(torch.argmin(u1).item())
     mu2 = u1.to(cdt)[None, :] - (k ** 2)[:, None]
     A = torch.zeros(*mu2.shape, 2, 2, dtype=cdt, device=u1.device)
     A[..., 0, 1] = 1
     A[..., 1, 0] = mu2
     P = cell_propagators(A, mu2, grid.h)
-    TL = ordered_product(P[:, :m])
-    TR = ordered_product(P[:, m:])
     ik = 1j * k
-    v_minus = torch.exp(-ik * grid.x_left)[:, None] * (TL @ torch.stack([torch.ones_like(k), -ik], -1)[..., None])[..., 0]
-    v_plus = torch.exp(ik * grid.x_right)[:, None] * (_inv2(TR) @ torch.stack([torch.ones_like(k), ik], -1)[..., None])[..., 0]
-    return _match(v_minus, v_plus)
+    out = []
+    for i in range(k.numel()):
+        m = _split_index(grid, float(x_match[i]))
+        TL = ordered_product(P[i, :m])
+        TR = ordered_product(P[i, m:])
+        v_minus = torch.exp(-ik[i] * grid.x_left) * (TL @ torch.stack([torch.ones_like(ik[i]), -ik[i]]))
+        v_plus = torch.exp(ik[i] * grid.x_right) * (_inv2(TR) @ torch.stack([torch.ones_like(ik[i]), ik[i]]))
+        out.append(_match(v_minus, v_plus))
+    return torch.stack(out)
 
 
-def _zakharov_shabat_bound_b_raw(q1: Tensor, zeta: Tensor, grid: Grid) -> Tensor:
-    """b(zeta_n) at ZS eigenvalues, by matching phi (from the left) with psi
-    (from the right) at the peak of |q|.  q1: (n,), zeta: (K,)."""
+def _zakharov_shabat_bound_b_raw(q1: Tensor, zeta: Tensor, grid: Grid, x_match: Tensor) -> Tensor:
+    """b(zeta_n) at ZS eigenvalues by matching phi (from the left) with psi
+    (from the right) at x_match (eigenfunction peak).  q1: (n,), zeta: (K,)."""
     cdt = complex_dtype(q1.dtype)
     q1 = q1.to(cdt)
     zeta = zeta.to(cdt)
-    m = int(torch.argmax(q1.abs()).item())
     z_ = zeta[:, None]
     qq = q1[None, :]
     mu2 = -(z_ ** 2) - qq.abs() ** 2
     A = torch.empty(*mu2.shape, 2, 2, dtype=cdt, device=q1.device)
     A[..., 0, 0] = -1j * z_
     A[..., 1, 1] = 1j * z_
-    A[..., 0, 1] = qq
-    A[..., 1, 0] = -qq.conj()
+    A[..., 0, 1] = qq.expand_as(z_ * qq)
+    A[..., 1, 0] = -qq.conj().expand_as(z_ * qq)
     P = cell_propagators(A, mu2, grid.h)
-    TL = ordered_product(P[:, :m])
-    TR = ordered_product(P[:, m:])
-    phi = torch.exp(-1j * zeta * grid.x_left)[:, None] * TL[..., :, 0]
-    psi = torch.exp(1j * zeta * grid.x_right)[:, None] * _inv2(TR)[..., :, 1]
-    return _match(phi, psi)
+    out = []
+    for i in range(zeta.numel()):
+        m = _split_index(grid, float(x_match[i]))
+        TL = ordered_product(P[i, :m])
+        TR = ordered_product(P[i, m:])
+        phi = torch.exp(-1j * zeta[i] * grid.x_left) * TL[:, 0]
+        psi = torch.exp(1j * zeta[i] * grid.x_right) * _inv2(TR)[:, 1]
+        out.append(_match(phi, psi))
+    return torch.stack(out)
+
+
+def _subsample(v: Tensor, grid: Grid, max_points: int) -> tuple[Tensor, Tensor, float]:
+    stride = max(1, math.ceil(grid.n / max_points))
+    xs = grid.x_min + grid.h * torch.arange(0, grid.n, stride, dtype=torch.float64, device=v.device)
+    return v[::stride], xs, grid.h * stride
+
+
+def kdv_eigenfunction_peaks(u1: Tensor, grid: Grid, kappa: Tensor, max_points: int = 800) -> Tensor:
+    """Approximate peak positions of the bound states with the given kappa,
+    from eigenvectors of a coarse finite-difference Hamiltonian."""
+    with torch.no_grad():
+        us, xs, h = _subsample(u1.to(torch.float64), grid, max_points)
+        n = us.numel()
+        off = torch.full((n - 1,), -1.0 / h ** 2, dtype=torch.float64, device=u1.device)
+        H = torch.diag(2.0 / h ** 2 + us) + torch.diag(off, 1) + torch.diag(off, -1)
+        w, V = torch.linalg.eigh(H)
+        j = torch.argmin((w[None, :] + kappa.detach().to(torch.float64)[:, None] ** 2).abs(), dim=1)
+        return xs[torch.argmax(V[:, j].abs(), dim=0)]
+
+
+def zs_eigenfunction_peaks(q1: Tensor, grid: Grid, zeta: Tensor, max_points: int = 512) -> Tensor:
+    """Approximate peak positions of the ZS eigenfunctions for eigenvalues zeta."""
+    with torch.no_grad():
+        L, xs = _zs_collocation(q1, grid, max_points)
+        w, V = torch.linalg.eig(L)
+        n = xs.numel()
+        j = torch.argmin((w[None, :] - zeta.detach().to(torch.complex128)[:, None]).abs(), dim=1)
+        dens = V[:n, j].abs() ** 2 + V[n:, j].abs() ** 2
+        return xs[torch.argmax(dens, dim=0)]
 
 
 # ---------------------------------------------------------------------------
@@ -327,12 +373,12 @@ def _coarse(v: Tensor, grid: Grid) -> tuple[Tensor, Grid]:
     return v[..., 1:2 * m:2], Grid(grid.x_min + grid.h, grid.x_min + (2 * m - 1) * grid.h, m)
 
 
-def _richardson(fn, v: Tensor, k: Tensor, grid: Grid, richardson: bool):
-    out = fn(v, k, grid)
+def _richardson(fn, v: Tensor, k: Tensor, grid: Grid, richardson: bool, *extra):
+    out = fn(v, k, grid, *extra)
     if not richardson or grid.n < 9:
         return out
     vc, gc = _coarse(v, grid)
-    outc = fn(vc, k, gc)
+    outc = fn(vc, k, gc, *extra)
     if isinstance(out, tuple):
         return tuple((4 * f - c) / 3 for f, c in zip(out, outc))
     return (4 * out - outc) / 3
@@ -353,12 +399,12 @@ def zakharov_shabat_ab(q: Tensor, zeta: Tensor, grid: Grid, richardson: bool = T
     return _richardson(_zakharov_shabat_ab_raw, q, zeta, grid, richardson)
 
 
-def schrodinger_bound_b(u1: Tensor, k: Tensor, grid: Grid, richardson: bool = True) -> Tensor:
-    return _richardson(_schrodinger_bound_b_raw, u1, k, grid, richardson)
+def schrodinger_bound_b(u1: Tensor, k: Tensor, grid: Grid, x_match: Tensor, richardson: bool = True) -> Tensor:
+    return _richardson(_schrodinger_bound_b_raw, u1, k, grid, richardson, x_match)
 
 
-def zakharov_shabat_bound_b(q1: Tensor, zeta: Tensor, grid: Grid, richardson: bool = True) -> Tensor:
-    return _richardson(_zakharov_shabat_bound_b_raw, q1, zeta, grid, richardson)
+def zakharov_shabat_bound_b(q1: Tensor, zeta: Tensor, grid: Grid, x_match: Tensor, richardson: bool = True) -> Tensor:
+    return _richardson(_zakharov_shabat_bound_b_raw, q1, zeta, grid, richardson, x_match)
 
 
 # ---------------------------------------------------------------------------
@@ -445,7 +491,8 @@ def kdv_direct(u: Tensor, x: Tensor, k: Tensor | None = None, *, reflection: boo
         # one differentiable Newton step: exact first-order sensitivity
         kap = k0 - a0 / da0.detach()
         a_k = _fd_derivative(f, kap, d)
-        b = schrodinger_bound_b(u1, 1j * kap.to(complex_dtype(u1.dtype)), grid).real
+        xm = kdv_eigenfunction_peaks(u1, grid, kap)
+        b = schrodinger_bound_b(u1, 1j * kap.to(complex_dtype(u1.dtype)), grid, xm).real
         c2 = b / a_k
         logcs.append(0.5 * torch.log(c2.abs()))
         kappas.append(kap)
@@ -488,20 +535,26 @@ def _fourier_diff_matrix(n: int, h: float, dtype, device) -> Tensor:
     return D.to(dtype)
 
 
+def _zs_collocation(q1: Tensor, grid: Grid, max_points: int) -> tuple[Tensor, Tensor]:
+    """Fourier-collocation matrix of the ZS eigenproblem
+    zeta v = [[i d/dx, -i q], [-i conj(q), -i d/dx]] v  on a subsampled grid."""
+    qs, xs, h = _subsample(q1.to(torch.complex128), grid, max_points)
+    n = qs.numel()
+    D = _fourier_diff_matrix(n, h, torch.complex128, q1.device)
+    Q = torch.diag(qs)
+    L = torch.cat([torch.cat([1j * D, -1j * Q], 1),
+                   torch.cat([-1j * Q.conj(), -1j * D], 1)], 0)
+    return L, xs
+
+
 def zs_eigenvalue_candidates(q1: Tensor, grid: Grid, max_points: int = 512) -> Tensor:
     """Fourier-collocation eigenvalues of the ZS operator in the upper half plane
     (initial guesses only; refined by Newton on a(zeta))."""
     with torch.no_grad():
-        stride = max(1, math.ceil(grid.n / max_points))
-        qs = q1[::stride].to(torch.complex128)
-        n = qs.numel()
-        h = grid.h * stride
-        D = _fourier_diff_matrix(n, h, torch.complex128, q1.device)
-        Q = torch.diag(qs)
-        L = torch.cat([torch.cat([1j * D, -1j * Q], 1),
-                       torch.cat([-1j * Q.conj(), -1j * D], 1)], 0)
+        L, xs = _zs_collocation(q1, grid, max_points)
+        h = float(xs[1] - xs[0])
         ev = torch.linalg.eigvals(L)
-        qmax = qs.abs().max().item()
+        qmax = q1.abs().max().item()
         keep = (ev.imag > 1e-3 * max(qmax, 1e-12)) & (ev.abs() < 4 * qmax + math.pi / h * 0.5)
         return ev[keep]
 
@@ -558,7 +611,8 @@ def nls_direct(q: Tensor, x: Tensor, xi: Tensor | None = None, *, reflection: bo
         da0 = _fd_derivative(f, z0, d)
         z = z0 - f(z0) / da0.detach()
         a_z = _fd_derivative(f, z, d)
-        b = zakharov_shabat_bound_b(q1, z, grid)
+        xm = zs_eigenfunction_peaks(q1, grid, z)
+        b = zakharov_shabat_bound_b(q1, z, grid, xm)
         zetas.append(z)
         logCs.append(torch.log(b / a_z))
     nmax = max((z.numel() for z in zetas), default=0)

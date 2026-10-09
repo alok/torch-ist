@@ -123,7 +123,9 @@ def default_spectral_grid(grid: Grid, k_max: float | None = None, dk: float | No
     solver needs (length 8 max|x|)."""
     L = max(abs(grid.x_left), abs(grid.x_right))
     if k_max is None:
-        k_max = min(math.pi / grid.h, 25.0)
+        # Richardson uses the 2h grid too; keep k * 2h < ~1.6 so both grids
+        # are in the asymptotic regime (beyond this the extrapolation is noise)
+        k_max = min(0.8 / grid.h, 25.0)
     if dk is None:
         dk = math.pi / (6.0 * L)
     return graded_spectral_grid(k_max, dk, device=device, dtype=dtype)
