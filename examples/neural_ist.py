@@ -32,6 +32,8 @@ import torch
 
 from torch_ist.neural import (
     FNO1dBaseline,
+    ScatteringEncoder,
+    SolitonDetector,
     ScatteringNeuralOperator,
     exact_kdv_solution,
     generate_kdv_soliton_data,
@@ -44,6 +46,8 @@ from _common import OUT
 
 p = argparse.ArgumentParser()
 p.add_argument("--quick", action="store_true")
+p.add_argument("--encoder", choices=["detector", "slots"], default="detector",
+               help="detector: translation-equivariant, count-agnostic (default); slots: CNN + MLP slot heads")
 p.add_argument("--device", default="mps" if torch.backends.mps.is_available() else
                ("cuda" if torch.cuda.is_available() else "cpu"))
 args = p.parse_args()
@@ -55,7 +59,7 @@ S = dict(n_train=600, enc=300, dec=300, e2e=200, fno=800) if args.quick else \
 N_SLOTS, T_TRAIN, T_EXT = 4, 2.0, 4.0
 x = torch.linspace(-20, 30, 384, dtype=torch.float64)
 h = float(x[1] - x[0])
-print(f"device={dev}  grid n={x.numel()} h={h:.3f}  config={S}")
+print(f"device={dev}  grid n={x.numel()} h={h:.3f}  encoder={args.encoder}  config={S}")
 
 # ---------------------------------------------------------------------------
 # data: scattering data sampled directly, u0 from the exact inverse transform
@@ -79,7 +83,8 @@ tests = {
 # ---------------------------------------------------------------------------
 # training
 # ---------------------------------------------------------------------------
-op = ScatteringNeuralOperator(x.float(), N_SLOTS).to(dev)
+enc = SolitonDetector(x.float(), N_SLOTS) if args.encoder == "detector" else ScatteringEncoder(x.float(), N_SLOTS)
+op = ScatteringNeuralOperator(x.float(), N_SLOTS, encoder=enc).to(dev)
 n_enc = sum(q.numel() for q in op.encoder.parameters())
 n_dec = sum(q.numel() for q in op.decoder.parameters())
 t0 = time.time()
@@ -136,8 +141,9 @@ with torch.no_grad():
     pred = op.encoder(ds.u0.to(dev, torch.float32))
 m = ds.slots.presence.bool()
 pres_acc = ((pred.presence.cpu() > 0.5) == m).all(-1).float().mean().item()
-dk = (pred.kappa.cpu().double() - ds.slots.kappa)[m].abs()
-dx = (pred.x0.cpu().double() - ds.slots.x0)[m].abs()
+both = m & (pred.presence.cpu() > 0.5)
+dk = (pred.kappa.cpu().double() - ds.slots.kappa)[both].abs()
+dx = (pred.x0.cpu().double() - ds.slots.x0)[both].abs()
 print(f"\nencoder: soliton count correct {100 * pres_acc:.1f}%, |d kappa| median {dk.median():.1e},"
       f" |d x0| median {dx.median():.1e}")
 
@@ -218,11 +224,11 @@ ax[1].set_title("encoder scattering loss")
 ax[1].set_xlabel("step")
 fig.savefig(OUT / "neural_ist_training.png", dpi=110)
 
-json.dump({"results": results, "speed_s": speed, "physics_residual": phys, "config": S,
+json.dump({"encoder_arch": args.encoder, "results": results, "speed_s": speed, "physics_residual": phys, "config": S,
            "encoder": {"count_acc": pres_acc, "dkappa_median": dk.median().item(), "dx0_median": dx.median().item()},
            "train_time_s": {"neural_ist": t_ours, "fno": t_fno}},
-          open(OUT / "neural_ist_results.json", "w"), indent=1)
-print("wrote", OUT / "neural_ist.png", OUT / "neural_ist_training.png", OUT / "neural_ist_results.json")
+          open(OUT / f"neural_ist_results_{args.encoder}.json", "w"), indent=1)
+print("wrote", OUT / "neural_ist.png", OUT / "neural_ist_training.png", OUT / f"neural_ist_results_{args.encoder}.json")
 torch.save({"op": op.state_dict(), "fno": fno.state_dict()}, OUT / "neural_ist_weights.pt")
 
 if not args.quick:
@@ -231,3 +237,47 @@ if not args.quick:
     assert r["in-dist (t<=2)"]["learned/learned"] < 0.1
     # the structural claim: exact evolution in scattering space extrapolates in time
     assert r["time extrap (2<t<=4)"]["learned/learned"] < r["time extrap (2<t<=4)"]["FNO"]
+
+
+# ---------------------------------------------------------------------------
+# interpretability: what did the decoder learn?
+# ---------------------------------------------------------------------------
+def plot_learned_laws(op: ScatteringNeuralOperator, path) -> dict:
+    """Compare the learned pairwise phase-shift law and soliton profile with
+    the exact KdV ones: Phi(r) = log((1+r)/|1-r|), U(xi) = -2 sech^2(xi)."""
+    dec = op.decoder
+    dt = next(dec.parameters()).dtype
+    dv = next(dec.parameters()).device
+    r = torch.linspace(0.05, 2.5, 400, dtype=dt, device=dv)
+    feats = torch.stack([r, torch.log((1 - r).abs() + 1e-3)], -1)
+    xi = torch.linspace(-6, 6, 400, dtype=dt, device=dv)
+    with torch.no_grad():
+        phi = dec.phase(feats)[:, 0].cpu().double()
+        prof = (dec.render(torch.stack([xi, torch.tanh(xi)], -1))[:, 0] / torch.cosh(xi)).cpu().double()
+    r, xi = r.cpu().double(), xi.cpu().double()
+    phi_exact = torch.log((1 + r) / (1 - r).abs())
+    prof_exact = -2 / torch.cosh(xi) ** 2
+    # training kappas lie in [0.4, 1.2] with gaps >= 0.05: ratios in ~[0.33, 3], |1 - r| >= ~0.04
+    seen = ((r > 0.35) & (r < 2.5) & ((1 - r).abs() > 0.1))
+    err_phi = ((phi - phi_exact)[seen].abs().max()).item()
+    err_prof = ((prof - prof_exact).abs().max()).item()
+    fig, ax = plt.subplots(1, 2, figsize=(12, 3.8), constrained_layout=True)
+    ax[0].plot(r, phi_exact, "k", lw=2.5, label=r"exact $\log\frac{1+r}{|1-r|}$")
+    ax[0].plot(r, phi, "C1--", lw=1.8, label=r"learned $\Phi_\theta(r)$")
+    ax[0].set_ylim(-0.5, 5)
+    ax[0].set_xlabel(r"$r = \kappa_m / \kappa_n$")
+    ax[0].set_title(f"pairwise phase-shift law (max err on |1-r|>0.1: {err_phi:.2f})")
+    ax[0].legend()
+    ax[1].plot(xi, prof_exact, "k", lw=2.5, label=r"exact $-2\,\mathrm{sech}^2\xi$")
+    ax[1].plot(xi, prof, "C1--", lw=1.8, label=r"learned $g_\theta(\xi)\,\mathrm{sech}\,\xi$")
+    ax[1].set_xlabel(r"$\xi = \kappa (x - x_n)$")
+    ax[1].set_title(f"universal soliton profile (max err {err_prof:.3f})")
+    ax[1].legend()
+    fig.savefig(path, dpi=110)
+    return {"phase_law_max_err": err_phi, "profile_max_err": err_prof}
+
+
+if __name__ == "__main__":
+    laws = plot_learned_laws(op, OUT / "neural_ist_learned_laws.png")
+    print(f"learned laws vs exact KdV: phase-shift max err {laws['phase_law_max_err']:.3f},"
+          f" soliton profile max err {laws['profile_max_err']:.4f}")

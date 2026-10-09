@@ -142,3 +142,26 @@ def test_training_reduces_loss(x, ds):
 def test_fno_baseline_shape(x, ds):
     fno = FNO1dBaseline(x, width=16, modes=16)
     assert fno(ds.u0[:3], torch.tensor([0.0, 1.0])).shape == (3, 2, x.numel())
+
+
+def test_detector_equivariance_and_count(x, ds):
+    from torch_ist.neural import SolitonDetector, detection_loss
+    torch.manual_seed(0)
+    det = SolitonDetector(x, n_slots=5, width=16, dilations=(1, 2, 4))
+    # train briefly so peaks exist, then check shift-equivariance of the decoded slots
+    opt = torch.optim.Adam(det.parameters(), lr=3e-3)
+    for _ in range(150):
+        pred = det(ds.u0[:32])
+        loss = det.loss(pred, ds.slots[:32])
+        opt.zero_grad(); loss.backward(); opt.step()
+    assert loss.item() < 5.0
+    h = float(x[1] - x[0])
+    u = torch.zeros(1, x.numel())
+    u[0, 60:-60] = ds.u0[0, 60:-60]
+    shift = 7
+    with torch.no_grad():
+        a, b = det(u), det(torch.roll(u, shift, -1))
+    pa, pb = a.presence[0] > 0, b.presence[0] > 0
+    assert torch.equal(pa, pb)
+    assert torch.allclose(b.x0[0][pb], a.x0[0][pa] + shift * h, atol=1e-4)
+    assert torch.allclose(b.kappa[0][pb], a.kappa[0][pa], atol=1e-4)

@@ -26,7 +26,8 @@ soliton it is its centre, which keeps the regression targets O(domain size).
 Contents
 --------
 SolitonSlots                 slot representation + exact evolution + conversions
-ScatteringEncoder            1-D CNN: u(x) -> slots (+ R)
+ScatteringEncoder            1-D CNN + MLP slot heads: u(x) -> slots (+ R)
+SolitonDetector              fully convolutional, translation-equivariant, count-agnostic encoder
 ScatteringDecoder            translation-equivariant renderer + dilated CNN: slots -> u(x)
 ScatteringNeuralOperator     the end-to-end operator with exact/learned switches
 FNO1dBaseline                standard FNO taking (u0, t) -> u(x,t), for comparison
@@ -73,6 +74,7 @@ class SolitonSlots:
     logits: Tensor | None = None
     R: Tensor | None = None
     k: Tensor | None = None
+    aux: dict | None = None   # dense encoder outputs (SolitonDetector), used only by its loss
 
     # -- exact dynamics --------------------------------------------------
     def evolve(self, t: Tensor) -> "SolitonSlots":
@@ -125,7 +127,8 @@ class SolitonSlots:
                 a2 = [complex_dtype(a) if isinstance(a, torch.dtype) else a for a in args]
                 return v.to(*a2, **kwargs)
             return v.to(*args, **kwargs)
-        return SolitonSlots(*(mv(v) for v in (self.kappa, self.x0, self.presence, self.logits, self.R, self.k)))
+        return SolitonSlots(*(mv(v) for v in (self.kappa, self.x0, self.presence, self.logits, self.R, self.k)),
+                            aux=self.aux)
 
     def flatten(self) -> tuple["SolitonSlots", tuple[int, ...]]:
         lead = self.kappa.shape[:-1]
@@ -215,6 +218,76 @@ class ScatteringEncoder(nn.Module):
             R = R.reshape(*lead, -1)
         rs = lambda v: v.reshape(*lead, N)  # noqa: E731
         return SolitonSlots(rs(kappa), rs(x0), torch.sigmoid(rs(logits)), rs(logits), R, self.k)
+
+    def loss(self, pred: SolitonSlots, target: SolitonSlots) -> Tensor:
+        return scattering_loss(pred, target)
+
+
+class SolitonDetector(nn.Module):
+    """Translation-equivariant, count-agnostic learned direct transform.
+
+    The exact direct transform commutes with translations (shifting u shifts
+    every x0) and does not care how many solitons there are.  A slot-MLP
+    encoder has neither property.  This detector is fully convolutional (no
+    coordinate channel; per-position channel norm) and predicts at every grid
+    point x_j a soliton logit, kappa, and a sub-grid offset, CenterNet style:
+
+        x0 = x_j + offset_j  at local maxima of sigmoid(logit) above threshold,
+
+    keeping the top n_slots peaks, sorted by kappa.  Trained with a focal loss
+    on a Gaussian heatmap around each true x0 plus kappa/offset regression at
+    the centre cells (`detection_loss`).  Reflection coefficients are not
+    predicted (R picks up a phase e^{2ika} under translation, which needs a
+    different head).
+    """
+
+    def __init__(self, x: Tensor, n_slots: int = 4, width: int = 64,
+                 dilations: tuple[int, ...] = (1, 2, 4, 8, 16, 32, 64, 1, 2, 4, 8, 16, 32, 64),
+                 threshold: float = 0.3, u_scale: float = 2.0):
+        super().__init__()
+        self.register_buffer("x", x.to(torch.get_default_dtype()))
+        self.h = float(x[1] - x[0])
+        self.n_slots = n_slots
+        self.threshold = threshold
+        self.u_scale = u_scale
+        self.lift = nn.Conv1d(1, width, 5, padding=2)
+        self.blocks = nn.Sequential(*[_ResBlock(width, d) for d in dilations])
+        self.head = nn.Conv1d(width, 3, 1)
+        nn.init.constant_(self.head.bias, 0.0)
+        with torch.no_grad():
+            self.head.bias[0] = -4.0     # prior: almost no grid cell holds a soliton
+
+    def dense(self, u0: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+        u = u0.reshape(-1, u0.shape[-1]).to(_param_dtype(self))
+        out = self.head(self.blocks(self.lift(u[:, None] / self.u_scale)))
+        obj = out[:, 0]
+        kappa = F.softplus(out[:, 1]) + 0.05
+        offset = 2 * self.h * torch.tanh(out[:, 2])
+        return obj, kappa, offset
+
+    def forward(self, u0: Tensor) -> SolitonSlots:
+        lead = u0.shape[:-1]
+        obj, kmap, omap = self.dense(u0)
+        prob = torch.sigmoid(obj)
+        peak = (prob == F.max_pool1d(prob[:, None], 5, 1, 2)[:, 0]) & (prob > self.threshold)
+        score = torch.where(peak, prob, torch.full_like(prob, -1.0))
+        val, idx = score.topk(self.n_slots, dim=-1)
+        present = val > 0
+        kappa = kmap.gather(-1, idx)
+        x0 = self.x.to(kmap.dtype)[idx] + omap.gather(-1, idx)
+        logits = obj.gather(-1, idx)
+        key = torch.where(present, kappa, torch.full_like(kappa, -1.0))
+        order = key.argsort(-1, descending=True)
+        g = lambda v: v.gather(-1, order)  # noqa: E731
+        kappa, x0, logits, present = g(kappa), g(x0), g(logits), g(present)
+        kappa = torch.where(present, kappa, torch.ones_like(kappa))
+        x0 = torch.where(present, x0, torch.zeros_like(x0))
+        rs = lambda v: v.reshape(*lead, self.n_slots)  # noqa: E731
+        return SolitonSlots(rs(kappa), rs(x0), rs(present.to(kappa.dtype)), rs(logits), None, None,
+                            aux={"obj": obj, "kappa_map": kmap, "offset_map": omap})
+
+    def loss(self, pred: SolitonSlots, target: SolitonSlots) -> Tensor:
+        return detection_loss(pred, target, self.x, self.h)
 
 
 class _ZeroPreservingBlock(nn.Module):
@@ -579,6 +652,36 @@ def scattering_loss(pred: SolitonSlots, target: SolitonSlots, x_scale: float = 1
     return loss
 
 
+def detection_loss(pred: SolitonSlots, target: SolitonSlots, x: Tensor, h: float,
+                   sigma_cells: float = 1.5, w_kappa: float = 1.0, w_offset: float = 1.0) -> Tensor:
+    """CenterNet-style loss for `SolitonDetector`: penalty-reduced focal loss on
+    a Gaussian heatmap centred at each true x0, plus kappa and offset
+    regression at the centre cells.  Offsets are measured in grid cells."""
+    obj, kmap, omap = pred.aux["obj"], pred.aux["kappa_map"], pred.aux["offset_map"]
+    B, n = obj.shape
+    tk, tx, m = (v.reshape(B, -1) for v in (target.kappa, target.x0, target.presence))
+    m = m > 0.5
+    j = ((tx - float(x[0])) / h).round().long().clamp(0, n - 1)                  # (B, N)
+    i = torch.arange(n, device=obj.device, dtype=obj.dtype)
+    gauss = torch.exp(-0.5 * ((i[None, None, :] - j[..., None].to(obj.dtype)) / sigma_cells) ** 2)
+    gauss = torch.where(m[..., None], gauss, torch.zeros_like(gauss))
+    heat = gauss.amax(1)                                                       # (B, n)
+    pos = torch.zeros_like(heat, dtype=torch.bool)
+    pos.scatter_(1, torch.where(m, j, torch.zeros_like(j)), m)
+    p = torch.sigmoid(obj).clamp(1e-6, 1 - 1e-6)
+    lpos = -((1 - p) ** 2 * torch.log(p))[pos].sum()
+    lneg = -(((1 - heat) ** 4) * p ** 2 * torch.log(1 - p))[~pos].sum()
+    npos = pos.sum().clamp_min(1)
+    loss = (lpos + lneg) / npos
+    kj = kmap.gather(1, j)
+    oj = omap.gather(1, j)
+    off_t = tx - x.to(obj.dtype)[j]
+    mm = m.to(obj.dtype)
+    loss = loss + w_kappa * (mm * (kj - tk) ** 2).sum() / mm.sum().clamp_min(1)
+    loss = loss + w_offset * (mm * ((oj - off_t) / h) ** 2).sum() / mm.sum().clamp_min(1)
+    return loss
+
+
 def _d1(u: Tensor, h: float) -> Tensor:
     """4th-order central first derivative (zero-padded edges)."""
     # F.conv1d is a cross-correlation: weights are in u[i-2], ..., u[i+2] order
@@ -661,7 +764,7 @@ def train(op: ScatteringNeuralOperator, data: KdVDataset, stage: Literal["encode
         u0 = u0.to(ndt).to(dev)
         logs: dict[str, float] = {}
         if stage == "encoder":
-            loss = scattering_loss(op.encoder(u0), target_d)
+            loss = op.encoder.loss(op.encoder(u0), target_d)
             logs["scatter"] = loss.item()
         else:
             t64 = t_max * torch.rand(n_times, generator=g, dtype=torch.float64)
@@ -675,7 +778,7 @@ def train(op: ScatteringNeuralOperator, data: KdVDataset, stage: Literal["encode
                 slots = op.encoder(u0)
                 pred = op.decoder(slots.evolve(t))
                 lu = potential_loss(pred, u_true)
-                ls = scattering_loss(slots, target_d)
+                ls = op.encoder.loss(slots, target_d)
                 loss = lu + scattering_weight * ls
                 logs["u_rel"], logs["scatter"] = lu.item(), ls.item()
                 if physics_weight > 0:
@@ -735,7 +838,7 @@ def train_baseline(model: FNO1dBaseline, data: KdVDataset, steps: int = 2000, ba
 
 
 __all__ = [
-    "SolitonSlots", "ScatteringEncoder", "ScatteringDecoder", "ScatteringNeuralOperator", "FNO1dBaseline",
+    "SolitonSlots", "ScatteringEncoder", "SolitonDetector", "detection_loss", "ScatteringDecoder", "ScatteringNeuralOperator", "FNO1dBaseline",
     "KdVDataset", "generate_kdv_soliton_data", "generate_kdv_general_data", "exact_kdv_solution",
     "potential_loss", "scattering_loss", "kdv_residual", "kdv_residual_loss", "train", "train_baseline",
 ]
