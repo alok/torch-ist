@@ -14,7 +14,7 @@ solution. This package implements the full pipeline for
 
 ```bash
 pip install -e .            # or: uv sync
-pytest                      # 43 tests, ~25 s on CPU
+pytest                      # 56 tests, ~40 s on CPU
 python examples/kdv_soliton.py
 ```
 
@@ -59,6 +59,8 @@ torch_ist/
   nls.py        NLS pipeline, exact solitons, split-step Fourier solver
   utils.py      grids, spectral grids, 2x2 propagators
   visualize.py  spacetime heatmaps, IST-vs-PDE comparison panels, spectra
+  neural.py     learnable IST: encoders, symmetry-structured decoder, exact latent evolution,
+                hybrid exact/learned modes, data generation, losses, training, FNO baseline
 ```
 
 ### Numerics, briefly
@@ -106,6 +108,43 @@ Each example writes PNGs to `examples/output/` and asserts its own correctness c
 | `nls_soliton.py` | `sech x` soliton, `2 sech x` breather, `1.2 sech x` soliton + radiation (Marchenko) |
 | `kdv_radiation.py` | `−2.5 e^{−x²}`: soliton + dispersive tail, solitons-only part, spectrum |
 | `learn_soliton_params.py` | autodiff: fit (κ, x₀) to a noisy snapshot; L-BFGS through the *direct* transform |
+| `neural_ist.py` | train the scattering-space neural operator and an FNO baseline; generalization, speed, learned-law plots (~20 min on MPS; `--quick` for a smoke run) |
+
+## Neural IST: a scattering-space neural operator (`torch_ist.neural`)
+
+FNO learns in Fourier space, where *linear* PDEs diagonalize. For integrable PDEs, scattering space is the
+diagonalizing domain: KdV time evolution there is `x₀ₙ += 4κₙ²t`, `R *= e^{8ik³t}`. `ScatteringNeuralOperator`
+learns only the direct and inverse transforms and evolves **exactly** in between. Each transform can be set to
+`"exact"` or `"learned"`, which gives a classical, hybrid, or fully neural model:
+
+```python
+from torch_ist.neural import ScatteringNeuralOperator, SolitonDetector, generate_kdv_soliton_data, train
+x = torch.linspace(-20, 30, 384)
+data = generate_kdv_soliton_data(6000, x.double())                 # exact (u0, scattering data) pairs
+op = ScatteringNeuralOperator(x, n_slots=4, encoder=SolitonDetector(x, 4)).to("mps")
+train(op, data, "encoder"); train(op, data, "decoder"); train(op, data, "end_to_end", physics_weight=1e-3)
+op.set_mode(forward="learned", inverse="exact")                    # or any combination
+u = op(u0, t)                                                       # (B, Nt, n)
+```
+
+Results from `examples/neural_ist.py` (relative L2 error of u(x,t); details in [docs/NEURAL.md](docs/NEURAL.md)):
+
+| test set | learned inverse only | fully learned | FNO (same steps) |
+|---|---|---|---|
+| in distribution, t ≤ 2 | 1.3e-2 | 4.9e-2 | **1.1e-2** |
+| **time extrapolation, 2 < t ≤ 4** | **4.6e-3** | **4.5e-2** | 1.49 |
+| 4 solitons (trained on ≤ 3) | 0.14 | 0.63 | 0.13 |
+| κ out of training range | **5.1e-2** | 0.49 | 0.43 |
+
+* Time never enters a network, so extrapolating in t is free. FNO falls apart beyond its training horizon.
+* The learned decoder rediscovers the KdV two-soliton phase-shift law `log((1+r)/|1−r|)` (error 0.08) and the
+  soliton profile `−2sech²` (error 3e-4) without being told either.
+* The learned *direct* transform is the weak link out of distribution (unseen amplitudes and counts).
+  In distribution, FNO is 2–4× more accurate than the fully learned pipeline.
+* Using the learned encoder in place of the exact direct transform makes inference 12× faster.
+
+Includes data generation, scattering, potential and physics-informed (KdV residual) losses, a staged
+`train()`, an FNO baseline, and a translation-equivariant, count-agnostic `SolitonDetector` encoder.
 
 ## GPU, batching, autodiff
 
