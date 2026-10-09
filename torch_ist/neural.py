@@ -221,14 +221,19 @@ class ScatteringDecoder(nn.Module):
     """Learned inverse scattering transform  SolitonSlots -> u(x).
 
     1. Renderer: each slot is drawn by a shared MLP
-           f_n(x) = kappa_n^2 * g_theta(kappa_n, kappa_n (x - x0_n)),
-       which is translation-equivariant and respects the KdV scaling symmetry
-       u -> kappa^2 U(kappa x) by construction; g_theta is learned.
+           f_n(x) = kappa_n^2 * g_theta(kappa_n (x - x0_n)).
+       g_theta does not see kappa: KdV's scaling symmetry u -> kappa^2 U(kappa x)
+       makes an isolated soliton exactly of this form with a universal U, so the
+       renderer extrapolates to unseen amplitudes by construction.  It is also
+       translation-equivariant.
     2. Interaction network: a dilated residual CNN *without* a coordinate
-       channel (so the whole decoder is translation-equivariant) reads the
-       individual weighted slot fields, their sum, and -- if radiation is
-       present -- the exact linear Born feature F_c(2x) = (1/2pi) int R e^{2ikx} dk,
-       and outputs a correction to the summed field.
+       channel (so the decoder is translation-equivariant) reads permutation-
+       invariant, count-agnostic features of the weighted slot fields --
+           S1 = sum f_n,  S2 = sum f_n^2,  overlap = sum_{i<j} f_i f_j = (S1^2 - S2)/2
+       -- plus, if radiation is present, the exact linear Born feature
+       F_c(2x) = (1/2pi) int R e^{2ikx} dk, and outputs a correction to S1.
+       Because only symmetric functions of the slots enter, the decoder is
+       invariant to slot order and applies unchanged to any number of solitons.
     """
 
     def __init__(self, x: Tensor, n_slots: int = 4, width: int = 48,
@@ -237,7 +242,7 @@ class ScatteringDecoder(nn.Module):
         super().__init__()
         self.register_buffer("x", x.to(torch.get_default_dtype()))
         self.n_slots = n_slots
-        self.render = nn.Sequential(nn.Linear(3, hidden), nn.GELU(), nn.Linear(hidden, hidden), nn.GELU(),
+        self.render = nn.Sequential(nn.Linear(2, hidden), nn.GELU(), nn.Linear(hidden, hidden), nn.GELU(),
                                     nn.Linear(hidden, hidden), nn.GELU(), nn.Linear(hidden, 1))
         self.use_radiation = k is not None
         if k is not None:
@@ -246,7 +251,7 @@ class ScatteringDecoder(nn.Module):
             E = torch.exp(2j * x.double()[:, None] * k.double()[None, :]) * w
             self.register_buffer("born_re", E.real.to(torch.get_default_dtype()))
             self.register_buffer("born_im", E.imag.to(torch.get_default_dtype()))
-        c_in = n_slots + 1 + (1 if k is not None else 0)
+        c_in = 3 + (1 if k is not None else 0)
         self.lift = nn.Conv1d(c_in, width, 5, padding=2)
         self.blocks = nn.Sequential(*[_ResBlock(width, d) for d in dilations])
         self.proj = nn.Conv1d(width, 1, 1)
@@ -256,8 +261,7 @@ class ScatteringDecoder(nn.Module):
     def slot_fields(self, kappa: Tensor, x0: Tensor) -> Tensor:
         """(B, N) -> (B, N, n_x) per-slot rendered profiles."""
         xi = kappa[..., None] * (self.x.to(kappa.dtype) - x0[..., None])
-        kk = kappa[..., None].expand_as(xi)
-        feats = torch.stack([kk, xi, torch.tanh(xi)], -1)
+        feats = torch.stack([xi, torch.tanh(xi)], -1)
         return kappa[..., None] ** 2 * self.render(feats)[..., 0]
 
     def forward(self, slots: SolitonSlots) -> Tensor:
@@ -265,8 +269,9 @@ class ScatteringDecoder(nn.Module):
         dt = _param_dtype(self)
         kappa, x0, p = s.kappa.to(dt), s.x0.to(dt), s.presence.to(dt)
         fields = p[..., None] * self.slot_fields(kappa, x0)              # (B, N, n_x)
-        base = fields.sum(1, keepdim=True)
-        chans = [base, fields]
+        base = fields.sum(1, keepdim=True)                                # S1
+        s2 = (fields ** 2).sum(1, keepdim=True)
+        chans = [base, s2, 0.5 * (base ** 2 - s2)]                        # S1, S2, pairwise overlap
         if self.use_radiation:
             if s.R is None:
                 chans.append(torch.zeros_like(base))
