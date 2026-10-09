@@ -20,7 +20,13 @@ from torch import Tensor
 
 from .direct import KdVScatteringData, kdv_direct
 from .inverse import kdv_inverse, kdv_reflectionless
-from .utils import Grid, sech
+from .direct import schrodinger_ab
+from .utils import Grid, complex_dtype, sech, time_aware_spectral_grid
+
+
+def _refl(u0: Tensor, k: Tensor, grid: Grid) -> Tensor:
+    a, b = schrodinger_ab(u0, k.to(complex_dtype(u0.dtype)), grid)
+    return b / a
 
 
 def kdv_soliton(x: Tensor, t, kappa: float, x0: float = 0.0) -> Tensor:
@@ -48,9 +54,17 @@ def kdv_ist_solve(u0: Tensor, x: Tensor, t: Tensor, *, reflection: bool = True,
     reflection: include the continuous spectrum (False = keep only solitons,
       i.e. the long-time soliton content of u0).
     x_out: reconstruction grid (default x).  Must be uniform for Marchenko.
+    k: spectral grid for R(k); by default one fine enough that the evolved
+      radiation (group speed 12 k^2) does not alias over the requested times.
     Returns (u, data) with u of shape (..., Nt, Nx_out).
     """
     x_out = x if x_out is None else x_out
+    t = torch.as_tensor(t, dtype=x.dtype, device=x.device).reshape(-1)
+    if reflection and k is None:
+        grid = Grid.from_x(x)
+        # radiation at wavenumber k moves left with speed 12 k^2; s = 2x
+        k = time_aware_spectral_grid(grid, lambda kk: _refl(u0, kk, grid), float(t.abs().max()),
+                                     lambda kk: 12 * kk ** 2, 2.0, device=x.device, dtype=x.dtype)
     data = kdv_direct(u0, x, k, reflection=reflection)
     return kdv_evolve_and_invert(data, x_out, t, method=method), data
 

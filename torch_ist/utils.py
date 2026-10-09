@@ -131,6 +131,28 @@ def default_spectral_grid(grid: Grid, k_max: float | None = None, dk: float | No
     return graded_spectral_grid(k_max, dk, device=device, dtype=dtype)
 
 
+def time_aware_spectral_grid(grid: Grid, refl_fn, t_max: float, speed, spread_coeff: float,
+                             tol: float = 1e-6, device=None, dtype: torch.dtype = DEFAULT_DTYPE) -> Tensor:
+    """Spectral grid fine enough for data evolved to time t_max.
+
+    Radiation of wavenumber k sits near x = -speed(k) t, i.e. at s = 2x in the
+    Marchenko kernel, so F(s) must be alias-free over a range that grows like
+    spread_coeff * speed(k_eff) * t.  k_eff is the largest |k| where the
+    reflection coefficient (evaluated by refl_fn on a default grid) exceeds
+    tol * max|refl|.  speed: callable k -> group speed magnitude."""
+    k0 = default_spectral_grid(grid, device=device, dtype=dtype)
+    if t_max <= 0:
+        return k0
+    r = refl_fn(k0).abs()
+    r = r.reshape(-1, r.shape[-1]).amax(0)
+    big = k0[r > tol * r.max()]
+    k_eff = big.abs().max().item() if big.numel() else 0.0
+    L = max(abs(grid.x_left), abs(grid.x_right))
+    span = 8 * L + spread_coeff * speed(k_eff) * t_max
+    dk = min(math.pi / (6.0 * L), 2 * math.pi / (1.5 * span))
+    return default_spectral_grid(grid, dk=dk, device=device, dtype=dtype)
+
+
 def quadrature_weights(k: Tensor) -> Tensor:
     """Trapezoid weights for a sorted, possibly non-uniform grid."""
     w = torch.zeros_like(k)

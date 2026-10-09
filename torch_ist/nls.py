@@ -20,7 +20,13 @@ from torch import Tensor
 
 from .direct import NLSScatteringData, nls_direct
 from .inverse import nls_inverse, nls_reflectionless
-from .utils import Grid, complex_dtype, sech
+from .direct import zakharov_shabat_ab
+from .utils import Grid, complex_dtype, sech, time_aware_spectral_grid
+
+
+def _refl(q0: Tensor, xi: Tensor, grid: Grid) -> Tensor:
+    a, b = zakharov_shabat_ab(q0.to(complex_dtype(q0.dtype)), xi.to(complex_dtype(q0.real.dtype)), grid)
+    return b / a
 
 
 def nls_soliton(x: Tensor, t, eta: float = 0.5, xi: float = 0.0, x0: float = 0.0, phase: float = 0.0) -> Tensor:
@@ -38,6 +44,12 @@ def nls_ist_solve(q0: Tensor, x: Tensor, t: Tensor, *, reflection: bool = True,
     """Solve the focusing NLS by inverse scattering.  q0: (..., n) on uniform x.
     Returns (q, data) with q of shape (..., Nt, Nx_out) complex."""
     x_out = x if x_out is None else x_out
+    t = torch.as_tensor(t, dtype=x.dtype, device=x.device).reshape(-1)
+    if reflection and xi is None:
+        grid = Grid.from_x(x)
+        # radiation at xi moves with speed 4|xi|; s = 2x
+        xi = time_aware_spectral_grid(grid, lambda kk: _refl(q0, kk, grid), float(t.abs().max()),
+                                      lambda kk: 4 * abs(kk), 2.0, device=x.device, dtype=x.dtype)
     data = nls_direct(q0, x, xi, reflection=reflection)
     return nls_evolve_and_invert(data, x_out, t, method=method), data
 
