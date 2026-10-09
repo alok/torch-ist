@@ -237,7 +237,13 @@ def kdv_marchenko(data: KdVScatteringData, x: Tensor, chunk: int | None = None) 
         if Ns:
             ZU = Z[..., 1:]
             a = (fc[..., None] * ZU).sum(-2)                                   # (..., C, Ns)
-            P = U.transpose(-1, -2) @ ZU                                       # (..., C, Ns, Ns)
+            # P = U^T B^{-1} U = (exact Gram integral) + U^T (B^{-1} - I) U: the
+            # identity part is integrated analytically, only the radiation
+            # coupling is left to the quadrature
+            ksum = data.kappa[..., None, :, None] + data.kappa[..., None, None, :]  # (..., 1, Ns, Ns)
+            Zend = (h * (2 * (n - 1 - idx))).to(dt)[:, None, None]                 # window length (C,1,1)
+            gram = -torch.expm1(-ksum * Zend) / ksum
+            P = U.transpose(-1, -2) @ (ZU - U) + gram                         # (..., C, Ns, Ns)
             gamma = (U * Z0[..., None]).sum(-2)                                # (..., C, Ns)
             log_lam = 2 * data.log_c[..., None, :] - 2 * data.kappa[..., None, :] * x[idx][:, None]
             log_lam = torch.where(data.mask[..., None, :], log_lam, torch.full_like(log_lam, _NEG))
@@ -297,7 +303,17 @@ def nls_marchenko(data: NLSScatteringData, x: Tensor, chunk: int | None = None) 
             a = (fc[..., None] * Z1[..., 1:]).sum(-2)                          # f_c M^{-1} calU
             VtZ = torch.cat([U.transpose(-1, -2) @ Z1, Ub.transpose(-1, -2) @ Z2], -2)  # calV^T M^{-1} [e0, calU]
             gamma = VtZ[..., 0]
-            P = VtZ[..., 1:]
+            # replace the quadrature of calV^T calU (the identity part of M_c)
+            # by the exact Gram integrals int_0^Z e^{i (zeta_m - conj zeta_n) z} dz
+            zero_ns = torch.zeros_like(U)
+            calU = torch.cat([torch.cat([Ub, zero_ns], -1), torch.cat([zero_ns, U], -1)], -2)
+            VtU = torch.cat([U.transpose(-1, -2) @ calU[..., :W, :], Ub.transpose(-1, -2) @ calU[..., W:, :]], -2)
+            dzeta = data.zeta[..., None, :, None] - data.zeta[..., None, None, :].conj()  # (..., 1, Ns, Ns)
+            Zend = (h * (2 * (n - 1 - idx))).to(cdt)[:, None, None]
+            Gam = torch.expm1(1j * dzeta * Zend) / (1j * dzeta)
+            Zb = torch.zeros_like(Gam)
+            gram = torch.cat([torch.cat([Gam, Zb], -1), torch.cat([Zb, Gam.conj()], -1)], -2)
+            P = VtZ[..., 1:] - VtU + gram
             log_abs, phase = _nls_lambda(data.zeta, data.log_C, data.mask, x[idx])
             Yg = _nls_Y_gamma(P, log_abs, phase, gamma)
             rho = torch.cat([torch.zeros(Ns, dtype=cdt, device=dev), -torch.ones(Ns, dtype=cdt, device=dev)])

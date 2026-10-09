@@ -411,17 +411,6 @@ def zakharov_shabat_bound_b(q1: Tensor, zeta: Tensor, grid: Grid, x_match: Tenso
 # KdV direct transform
 # ---------------------------------------------------------------------------
 
-def _kdv_a_kappa(u: Tensor, kappa: Tensor, grid: Grid) -> Tensor:
-    """a(i kappa) (real) for kappa of shape (..., M) matching u's batch."""
-    flat_u = u.reshape(-1, u.shape[-1])
-    flat_k = kappa.reshape(flat_u.shape[0], -1)
-    out = []
-    for ub, kb in zip(flat_u, flat_k):
-        a, _ = schrodinger_ab(ub, 1j * kb.to(complex_dtype(u.dtype)), grid)
-        out.append(a.real)
-    return torch.stack(out).reshape(kappa.shape)
-
-
 def _kdv_ab_kappa(u1: Tensor, kappa: Tensor, grid: Grid) -> tuple[Tensor, Tensor]:
     a, b = schrodinger_ab(u1, 1j * kappa.to(complex_dtype(u1.dtype)), grid)
     return a.real, b.real
