@@ -48,18 +48,21 @@ assert torch.allclose(x0.detach(), true["x0"], atol=5e-2)
 xd = torch.linspace(-15, 15, 401)
 A = torch.tensor(2.0, requires_grad=True)
 target = 1.5
-opt = torch.optim.Adam([A], lr=0.1)
-sched = torch.optim.lr_scheduler.ExponentialLR(opt, 0.97)
-hist = []
-for it in range(150):
+opt = torch.optim.LBFGS([A], lr=1.0, max_iter=50, tolerance_grad=1e-14, tolerance_change=1e-14,
+                        line_search_fn="strong_wolfe")
+hist = [A.item()]
+
+
+def closure():
     opt.zero_grad()
     data = ti.kdv_direct(-A / torch.cosh(xd) ** 2, xd, reflection=False)
-    k_top = data.kappa[data.mask].max()
-    loss = (k_top - target) ** 2
+    loss = (data.kappa[data.mask].max() - target) ** 2
     loss.backward()
-    opt.step()
-    sched.step()
     hist.append(A.item())
+    return loss
+
+
+opt.step(closure)
 print(f"(b) learned A = {A.item():.5f}   exact {target * (target + 1):.5f}")
 assert abs(A.item() - 3.75) < 1e-4
 
@@ -80,6 +83,6 @@ axs[0].plot(x, ti.kdv_from_solitons(x, t_obs, kappa.detach(), x0.detach())[0], l
 axs[0].legend(); axs[0].set_title("(a) inverse problem"); axs[0].set_xlabel("x")
 axs[1].semilogy(losses); axs[1].set_title("(a) loss"); axs[1].set_xlabel("Adam step")
 axs[2].plot(hist); axs[2].axhline(3.75, ls="--", color="k")
-axs[2].set_title(r"(b) depth $A$ so that $\kappa_{max}=1.5$"); axs[2].set_xlabel("Adam step")
+axs[2].set_title(r"(b) depth $A$ so that $\kappa_{max}=1.5$"); axs[2].set_xlabel("L-BFGS evaluation")
 fig.savefig(OUT / "learn_soliton_params.png", dpi=130)
 print("wrote", OUT / "learn_soliton_params.png")
