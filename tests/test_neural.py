@@ -81,16 +81,38 @@ def test_decoder_translation_equivariance():
     x = torch.linspace(-60, 60, 1201)   # receptive field is ~250 points each side
     dec = ScatteringDecoder(x, 2)
     with torch.no_grad():
-        for p in dec.proj.parameters():           # make the interaction CNN non-trivial
+        for p in dec.proj.parameters():           # make the collision CNN non-trivial
             p.normal_(0, 0.1)
     h = float(x[1] - x[0])
-    s = SolitonSlots(torch.tensor([[1.0, 0.6]]), torch.tensor([[-3.0, 2.0]]), torch.tensor([[1.0, 1.0]]))
+    s = SolitonSlots(torch.tensor([[1.0, 0.6]]), torch.tensor([[-1.0, 0.5]]), torch.tensor([[1.0, 1.0]]))
     shift = 10
     s2 = SolitonSlots(s.kappa, s.x0 + shift * h, s.presence)
     with torch.no_grad():
         u1, u2 = dec(s), dec(s2)
     # equivariant away from the zero-padded boundaries (receptive field ~ 250 points)
     assert (u2[0, 300 + shift:-300] - u1[0, 300:-300 - shift]).abs().max() < 1e-6
+
+
+def test_decoder_permutation_invariance_and_zero_collision_term():
+    x = torch.linspace(-60, 60, 1201)
+    dec = ScatteringDecoder(x, 3)
+    with torch.no_grad():
+        for p in dec.proj.parameters():
+            p.normal_(0, 0.1)
+    k, x0, pr = torch.tensor([[1.0, 0.7, 0.5]]), torch.tensor([[-25.0, 0.0, 30.0]]), torch.ones(1, 3)
+    perm = [2, 0, 1]
+    with torch.no_grad():
+        u1 = dec(SolitonSlots(k, x0, pr))
+        u2 = dec(SolitonSlots(k[:, perm], x0[:, perm], pr[:, perm]))
+        assert (u1 - u2).abs().max() < 1e-10
+        # well separated solitons: the collision network contributes nothing
+        xe = dec.effective_positions(k, x0, pr)
+        rendered = dec.slot_fields(k, xe).sum(1)
+        assert (u1 - rendered).abs().max() < 1e-4 * rendered.abs().max()
+        # an absent slot changes nothing
+        u3 = dec(SolitonSlots(torch.cat([k, torch.tensor([[0.9]])], 1), torch.cat([x0, torch.tensor([[3.0]])], 1),
+                              torch.cat([pr, torch.zeros(1, 1)], 1)))
+        assert (u1 - u3).abs().max() < 1e-10
 
 
 def test_physics_residual(x):

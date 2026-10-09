@@ -217,23 +217,44 @@ class ScatteringEncoder(nn.Module):
         return SolitonSlots(rs(kappa), rs(x0), torch.sigmoid(rs(logits)), rs(logits), R, self.k)
 
 
+class _ZeroPreservingBlock(nn.Module):
+    """Residual dilated conv block with no biases and no normalisation, so the
+    map is continuous at 0 with block(0) == 0 (GELU(0) = 0).  A scale-invariant
+    norm (LayerNorm, GroupNorm) would blow a 1e-6 input back up to O(1)."""
+
+    def __init__(self, width: int, dilation: int, kernel: int = 5):
+        super().__init__()
+        pad = dilation * (kernel - 1) // 2
+        self.c1 = nn.Conv1d(width, width, kernel, padding=pad, dilation=dilation, bias=False)
+        self.c2 = nn.Conv1d(width, width, kernel, padding=pad, dilation=dilation, bias=False)
+        nn.init.normal_(self.c2.weight, 0.0, 0.02 / math.sqrt(width * kernel))
+
+    def forward(self, h: Tensor) -> Tensor:
+        return h + self.c2(F.gelu(self.c1(F.gelu(h))))
+
+
 class ScatteringDecoder(nn.Module):
     """Learned inverse scattering transform  SolitonSlots -> u(x).
 
-    1. Renderer: each slot is drawn by a shared MLP
-           f_n(x) = kappa_n^2 * g_theta(kappa_n (x - x0_n)).
-       g_theta does not see kappa: KdV's scaling symmetry u -> kappa^2 U(kappa x)
-       makes an isolated soliton exactly of this form with a universal U, so the
-       renderer extrapolates to unseen amplitudes by construction.  It is also
+    Three learned pieces, each carrying an exact symmetry of KdV:
+
+    1. Pairwise phase shifts (in scattering space).  In right-Marchenko
+       coordinates soliton n is displaced by the solitons to its right, even
+       when far apart: x_n = x0_n - (1/kappa_n) sum_{m right of n} Phi(kappa_m/kappa_n).
+       We learn Phi_theta as an MLP of the ratio r = kappa_m/kappa_n (features
+       r, log|1 - r|) with a learned soft ordering sigmoid(s kappa_n (x0_m - x0_n)).
+       Permutation-equivariant, any number of solitons, scale-invariant.
+    2. Renderer: f_n(x) = kappa_n^2 g_theta(xi) sech(xi), xi = kappa_n (x - x_n),
+       with a single universal profile g_theta (KdV scaling symmetry
+       u -> kappa^2 U(kappa x)) inside an exponential-localisation envelope;
+       translation-equivariant, extrapolates in amplitude.
+    3. Collision network: a dilated CNN with *no biases*, fed only features
+       that vanish unless solitons overlap pointwise,
+           P = sum_{i<j} f_i f_j = (S1^2 - S2)/2,   T = sum_{i != j} f_i^2 f_j = S1 S2 - S3,
+       (plus the exact linear Born feature F_c(2x) of R when radiation is
+       modelled).  Its output is therefore exactly zero for separated
+       solitons; it only reshapes collision cores.  No coordinate channel, so
        translation-equivariant.
-    2. Interaction network: a dilated residual CNN *without* a coordinate
-       channel (so the decoder is translation-equivariant) reads permutation-
-       invariant, count-agnostic features of the weighted slot fields --
-           S1 = sum f_n,  S2 = sum f_n^2,  overlap = sum_{i<j} f_i f_j = (S1^2 - S2)/2
-       -- plus, if radiation is present, the exact linear Born feature
-       F_c(2x) = (1/2pi) int R e^{2ikx} dk, and outputs a correction to S1.
-       Because only symmetric functions of the slots enter, the decoder is
-       invariant to slot order and applies unchanged to any number of solitons.
     """
 
     def __init__(self, x: Tensor, n_slots: int = 4, width: int = 48,
@@ -244,6 +265,9 @@ class ScatteringDecoder(nn.Module):
         self.n_slots = n_slots
         self.render = nn.Sequential(nn.Linear(2, hidden), nn.GELU(), nn.Linear(hidden, hidden), nn.GELU(),
                                     nn.Linear(hidden, hidden), nn.GELU(), nn.Linear(hidden, 1))
+        self.phase = nn.Sequential(nn.Linear(2, hidden), nn.GELU(), nn.Linear(hidden, hidden), nn.GELU(),
+                                   nn.Linear(hidden, 1))
+        self.order_sharpness = nn.Parameter(torch.tensor(1.0))
         self.use_radiation = k is not None
         if k is not None:
             # Born feature F_c(2x) as a fixed linear map of R (real, since R(-k) = conj R(k))
@@ -251,36 +275,49 @@ class ScatteringDecoder(nn.Module):
             E = torch.exp(2j * x.double()[:, None] * k.double()[None, :]) * w
             self.register_buffer("born_re", E.real.to(torch.get_default_dtype()))
             self.register_buffer("born_im", E.imag.to(torch.get_default_dtype()))
-        c_in = 3 + (1 if k is not None else 0)
-        self.lift = nn.Conv1d(c_in, width, 5, padding=2)
-        self.blocks = nn.Sequential(*[_ResBlock(width, d) for d in dilations])
-        self.proj = nn.Conv1d(width, 1, 1)
+        c_in = 2 + (1 if k is not None else 0)
+        self.lift = nn.Conv1d(c_in, width, 5, padding=2, bias=False)
+        self.blocks = nn.Sequential(*[_ZeroPreservingBlock(width, d) for d in dilations])
+        self.proj = nn.Conv1d(width, 1, 1, bias=False)
         nn.init.zeros_(self.proj.weight)
-        nn.init.zeros_(self.proj.bias)
 
-    def slot_fields(self, kappa: Tensor, x0: Tensor) -> Tensor:
-        """(B, N) -> (B, N, n_x) per-slot rendered profiles."""
-        xi = kappa[..., None] * (self.x.to(kappa.dtype) - x0[..., None])
+    def effective_positions(self, kappa: Tensor, x0: Tensor, p: Tensor) -> Tensor:
+        """x0_n - (1/kappa_n) sum_m p_m [m right of n] Phi(kappa_m / kappa_n).  (B, N)."""
+        r = kappa[:, None, :] / kappa[:, :, None]                         # r[b, n, m] = kappa_m / kappa_n
+        feats = torch.stack([r, torch.log((1 - r).abs() + 1e-3)], -1)
+        phi = self.phase(feats)[..., 0]                                    # (B, N, N)
+        s = F.softplus(self.order_sharpness) * 4.0
+        right = torch.sigmoid(s * kappa[:, :, None] * (x0[:, None, :] - x0[:, :, None]))
+        off = 1.0 - torch.eye(kappa.shape[-1], dtype=kappa.dtype, device=kappa.device)
+        shift = (p[:, None, :] * right * phi * off).sum(-1) / kappa
+        return x0 - shift
+
+    def slot_fields(self, kappa: Tensor, x_pos: Tensor) -> Tensor:
+        """(B, N) -> (B, N, n_x) per-slot rendered profiles centred at x_pos."""
+        xi = kappa[..., None] * (self.x.to(kappa.dtype) - x_pos[..., None])
         feats = torch.stack([xi, torch.tanh(xi)], -1)
-        return kappa[..., None] ** 2 * self.render(feats)[..., 0]
+        # sech envelope: solitons are exponentially localised (true tail ~ e^{-2|xi|});
+        # the MLP shapes the profile within it
+        return kappa[..., None] ** 2 * self.render(feats)[..., 0] / torch.cosh(xi)
 
     def forward(self, slots: SolitonSlots) -> Tensor:
         s, lead = slots.flatten()
         dt = _param_dtype(self)
         kappa, x0, p = s.kappa.to(dt), s.x0.to(dt), s.presence.to(dt)
-        fields = p[..., None] * self.slot_fields(kappa, x0)              # (B, N, n_x)
-        base = fields.sum(1, keepdim=True)                                # S1
+        x_eff = self.effective_positions(kappa, x0, p)
+        fields = p[..., None] * self.slot_fields(kappa, x_eff)            # (B, N, n_x)
+        s1 = fields.sum(1, keepdim=True)
         s2 = (fields ** 2).sum(1, keepdim=True)
-        chans = [base, s2, 0.5 * (base ** 2 - s2)]                        # S1, S2, pairwise overlap
+        s3 = (fields ** 3).sum(1, keepdim=True)
+        chans = [0.5 * (s1 ** 2 - s2), s1 * s2 - s3]                       # vanish without overlap
         if self.use_radiation:
             if s.R is None:
-                chans.append(torch.zeros_like(base))
+                chans.append(torch.zeros_like(s1))
             else:
                 R = s.R
-                born = (R.real.to(dt) @ self.born_re.T.to(dt) - R.imag.to(dt) @ self.born_im.T.to(dt))  # Re(E R)
-                chans.append(born[:, None, :])
+                chans.append((R.real.to(dt) @ self.born_re.T.to(dt) - R.imag.to(dt) @ self.born_im.T.to(dt))[:, None, :])
         h = self.blocks(self.lift(torch.cat(chans, 1)))
-        u = base[:, 0] + self.proj(h)[:, 0]
+        u = s1[:, 0] + self.proj(h)[:, 0]
         return u.reshape(*lead, -1)
 
 
