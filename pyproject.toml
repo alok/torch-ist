@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "torch-ist"
+version = "0.1.0"
+description = "Inverse scattering transform (KdV, focusing NLS) in PyTorch: GPU, batched, differentiable"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = ["torch>=2.1", "numpy>=1.24", "matplotlib>=3.7"]
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+
+[dependency-groups]
+dev = ["pytest>=7"]
+
+[tool.setuptools]
+packages = ["torch_ist"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
