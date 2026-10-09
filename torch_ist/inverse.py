@@ -156,10 +156,13 @@ def _windows(grid: Grid, idx: Tensor, dtype, device) -> tuple[Tensor, Tensor, in
     l = torch.arange(W, device=device)
     last = 2 * (grid.n - 1 - idx)                                              # (C,)
     valid = l[None, :] <= last[:, None]
-    w = torch.full((len(idx), W), grid.h, dtype=dtype, device=device)
-    w[:, 0] = 0.5 * grid.h
-    w = torch.where(l[None, :] == last[:, None], 0.5 * w, w)
-    w = torch.where(valid, w, torch.zeros_like(w))
+    # Gregory end corrections (3rd-order trapezoid) at both ends of each window
+    g = torch.tensor([3 / 8, 7 / 6, 23 / 24], dtype=dtype, device=device)
+    w = torch.ones(len(idx), W, dtype=dtype, device=device)
+    for j in range(3):
+        w[:, j] = g[j]
+        w = torch.where(l[None, :] == (last - j)[:, None], g[j], w)
+    w = torch.where(valid, w * grid.h, torch.zeros_like(w))
     return torch.sqrt(w), valid, W
 
 
@@ -184,6 +187,14 @@ def _local_hankel(Fc: Tensor, idx: Tensor, W: int) -> tuple[Tensor, Tensor]:
     hidx = torch.clamp(2 * idx[:, None, None] + l[None, :, None] + l[None, None, :], max=top)
     fidx = torch.clamp(2 * idx[:, None] + l[None, :], max=top)
     return Fc[..., hidx], Fc[..., fidx]
+
+
+def _ddx(f: Tensor, h: float) -> Tensor:
+    """4th-order central first derivative along the last axis (2nd order at the edges)."""
+    d = torch.gradient(f, spacing=h, dim=-1, edge_order=2)[0]
+    if f.shape[-1] >= 5:
+        d[..., 2:-2] = (f[..., :-4] - 8 * f[..., 1:-3] + 8 * f[..., 3:-1] - f[..., 4:]) / (12 * h)
+    return d
 
 
 def _s_grid(grid: Grid, dtype, device) -> Tensor:
@@ -236,7 +247,7 @@ def kdv_marchenko(data: KdVScatteringData, x: Tensor, chunk: int | None = None) 
             K = K - ((1 - a) * Yg).sum(-1)
         Kxx.append(K / sw[:, 0])
     Kxx = torch.cat(Kxx, -1)
-    return -2 * torch.gradient(Kxx, spacing=h, dim=-1)[0]
+    return -2 * _ddx(Kxx, h)
 
 
 def nls_marchenko(data: NLSScatteringData, x: Tensor, chunk: int | None = None) -> Tensor:

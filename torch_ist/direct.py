@@ -76,15 +76,27 @@ class KdVScatteringData:
     def num_solitons(self) -> Tensor:
         return self.mask.sum(-1)
 
-    def evolve(self, t: float) -> "KdVScatteringData":
+    def evolve(self, t) -> "KdVScatteringData":
         """KdV flow u_t - 6uu_x + u_xxx = 0 in scattering space (dt = t - self.t):
-        kappa fixed, c_n^2 -> c_n^2 e^{8 kappa^3 dt}, R -> R e^{8 i k^3 dt}."""
-        dt = t - self.t
+        kappa fixed, c_n^2 -> c_n^2 e^{8 kappa^3 dt}, R -> R e^{8 i k^3 dt}.
+
+        t may be a float or a 1-D tensor of times, in which case a time axis is
+        inserted before the last dimension of every field: (..., Nt, N)."""
+        if isinstance(t, Tensor) and t.ndim == 1:
+            dt = (t.to(self.kappa.dtype).to(self.kappa.device) - self.t)[:, None]
+            kappa = self.kappa[..., None, :].expand(*self.kappa.shape[:-1], dt.shape[0], self.kappa.shape[-1])
+            mask = self.mask[..., None, :].expand(kappa.shape)
+            log_c = self.log_c[..., None, :] + 4 * kappa ** 3 * dt
+            R = None
+            if self.R is not None:
+                R = self.R[..., None, :] * torch.exp(8j * self.k.to(self.R.dtype) ** 3 * dt.to(self.R.dtype))
+            return replace(self, kappa=kappa, log_c=log_c, mask=mask, R=R, t=float("nan"))
+        dt = float(t) - self.t
         log_c = self.log_c + 4 * self.kappa ** 3 * dt
         R = None
         if self.R is not None:
             R = self.R * torch.exp(8j * self.k.to(self.R.dtype) ** 3 * dt)
-        return replace(self, log_c=log_c, R=R, t=t)
+        return replace(self, log_c=log_c, R=R, t=float(t))
 
     def reflectionless(self) -> "KdVScatteringData":
         return replace(self, k=None, R=None)
@@ -135,15 +147,25 @@ class NLSScatteringData:
     def num_solitons(self) -> Tensor:
         return self.mask.sum(-1)
 
-    def evolve(self, t: float) -> "NLSScatteringData":
+    def evolve(self, t) -> "NLSScatteringData":
         """Focusing NLS flow i q_t + q_xx + 2|q|^2 q = 0 in scattering space:
-        zeta fixed, C_n -> C_n e^{4 i zeta_n^2 dt}, r -> r e^{4 i xi^2 dt}."""
-        dt = t - self.t
+        zeta fixed, C_n -> C_n e^{4 i zeta_n^2 dt}, r -> r e^{4 i xi^2 dt}.
+        t: float or 1-D tensor (adds a time axis, see KdVScatteringData.evolve)."""
+        if isinstance(t, Tensor) and t.ndim == 1:
+            dt = (t.to(self.zeta.real.dtype).to(self.zeta.device) - self.t)[:, None].to(self.zeta.dtype)
+            zeta = self.zeta[..., None, :].expand(*self.zeta.shape[:-1], dt.shape[0], self.zeta.shape[-1])
+            mask = self.mask[..., None, :].expand(zeta.shape)
+            log_C = self.log_C[..., None, :] + 4j * zeta ** 2 * dt
+            r = None
+            if self.r is not None:
+                r = self.r[..., None, :] * torch.exp(4j * self.xi.to(self.r.dtype) ** 2 * dt)
+            return replace(self, zeta=zeta, log_C=log_C, mask=mask, r=r, t=float("nan"))
+        dt = float(t) - self.t
         log_C = self.log_C + 4j * self.zeta ** 2 * dt
         r = None
         if self.r is not None:
             r = self.r * torch.exp(4j * self.xi.to(self.r.dtype) ** 2 * dt)
-        return replace(self, log_C=log_C, r=r, t=t)
+        return replace(self, log_C=log_C, r=r, t=float(t))
 
     def reflectionless(self) -> "NLSScatteringData":
         return replace(self, xi=None, r=None)
@@ -181,7 +203,7 @@ def _chunk_size(n_cells: int, batch: int) -> int:
     return max(1, _CHUNK_ELEMS // max(1, n_cells * batch))
 
 
-def schrodinger_ab(u: Tensor, k: Tensor, grid: Grid) -> tuple[Tensor, Tensor]:
+def _schrodinger_ab_raw(u: Tensor, k: Tensor, grid: Grid) -> tuple[Tensor, Tensor]:
     """Jost coefficients a(k), b(k) of -psi'' + u psi = k^2 psi.
 
     u: (..., n) real potential samples on `grid`; k: (K,) complex, Im k >= 0
@@ -211,7 +233,7 @@ def schrodinger_ab(u: Tensor, k: Tensor, grid: Grid) -> tuple[Tensor, Tensor]:
     return torch.cat(outs_a, -1), torch.cat(outs_b, -1)
 
 
-def zakharov_shabat_ab(q: Tensor, zeta: Tensor, grid: Grid) -> tuple[Tensor, Tensor]:
+def _zakharov_shabat_ab_raw(q: Tensor, zeta: Tensor, grid: Grid) -> tuple[Tensor, Tensor]:
     """Jost coefficients a(zeta), b(zeta) of the Zakharov-Shabat system with
     focusing reduction r = -conj(q).  q: (..., n) complex; zeta: (K,) complex,
     or (..., K) matching q's batch shape.  Returns (..., K)."""
@@ -250,7 +272,7 @@ def _match(left: Tensor, right: Tensor) -> Tensor:
     return (right * left).sum(-1) / (right * right).sum(-1)
 
 
-def schrodinger_bound_b(u1: Tensor, k: Tensor, grid: Grid) -> Tensor:
+def _schrodinger_bound_b_raw(u1: Tensor, k: Tensor, grid: Grid) -> Tensor:
     """b(k) at bound states k = i kappa, computed stably by matching the left
     Jost solution (integrated rightwards) with the right Jost solution
     (integrated leftwards) at the bottom of the well.  u1: (n,), k: (K,)."""
@@ -270,7 +292,7 @@ def schrodinger_bound_b(u1: Tensor, k: Tensor, grid: Grid) -> Tensor:
     return _match(v_minus, v_plus)
 
 
-def zakharov_shabat_bound_b(q1: Tensor, zeta: Tensor, grid: Grid) -> Tensor:
+def _zakharov_shabat_bound_b_raw(q1: Tensor, zeta: Tensor, grid: Grid) -> Tensor:
     """b(zeta_n) at ZS eigenvalues, by matching phi (from the left) with psi
     (from the right) at the peak of |q|.  q1: (n,), zeta: (K,)."""
     cdt = complex_dtype(q1.dtype)
@@ -291,6 +313,52 @@ def zakharov_shabat_bound_b(q1: Tensor, zeta: Tensor, grid: Grid) -> Tensor:
     phi = torch.exp(-1j * zeta * grid.x_left)[:, None] * TL[..., :, 0]
     psi = torch.exp(1j * zeta * grid.x_right)[:, None] * _inv2(TR)[..., :, 1]
     return _match(phi, psi)
+
+
+# ---------------------------------------------------------------------------
+# Richardson extrapolation
+# ---------------------------------------------------------------------------
+# The exponential-midpoint scheme is symmetric, so its error expands in even
+# powers of h.  Combining the grid with the every-other-sample grid (cells of
+# width 2h centred on the odd samples) as (4 f_h - f_2h)/3 gives O(h^4).
+
+def _coarse(v: Tensor, grid: Grid) -> tuple[Tensor, Grid]:
+    m = (grid.n - 1) // 2
+    return v[..., 1:2 * m:2], Grid(grid.x_min + grid.h, grid.x_min + (2 * m - 1) * grid.h, m)
+
+
+def _richardson(fn, v: Tensor, k: Tensor, grid: Grid, richardson: bool):
+    out = fn(v, k, grid)
+    if not richardson or grid.n < 9:
+        return out
+    vc, gc = _coarse(v, grid)
+    outc = fn(vc, k, gc)
+    if isinstance(out, tuple):
+        return tuple((4 * f - c) / 3 for f, c in zip(out, outc))
+    return (4 * out - outc) / 3
+
+
+def schrodinger_ab(u: Tensor, k: Tensor, grid: Grid, richardson: bool = True) -> tuple[Tensor, Tensor]:
+    """Jost coefficients a(k), b(k) of -psi'' + u psi = k^2 psi.
+
+    u: (..., n) real potential samples on `grid`; k: (K,) complex with
+    Im k >= 0 (or real).  Returns a, b of shape (..., K).  O(h^4) with
+    Richardson extrapolation (default), O(h^2) without."""
+    return _richardson(_schrodinger_ab_raw, u, k, grid, richardson)
+
+
+def zakharov_shabat_ab(q: Tensor, zeta: Tensor, grid: Grid, richardson: bool = True) -> tuple[Tensor, Tensor]:
+    """Jost coefficients a(zeta), b(zeta) of the focusing Zakharov-Shabat
+    system.  q: (..., n) complex; zeta: (K,) complex.  Returns (..., K)."""
+    return _richardson(_zakharov_shabat_ab_raw, q, zeta, grid, richardson)
+
+
+def schrodinger_bound_b(u1: Tensor, k: Tensor, grid: Grid, richardson: bool = True) -> Tensor:
+    return _richardson(_schrodinger_bound_b_raw, u1, k, grid, richardson)
+
+
+def zakharov_shabat_bound_b(q1: Tensor, zeta: Tensor, grid: Grid, richardson: bool = True) -> Tensor:
+    return _richardson(_zakharov_shabat_bound_b_raw, q1, zeta, grid, richardson)
 
 
 # ---------------------------------------------------------------------------
